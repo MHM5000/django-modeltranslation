@@ -13,7 +13,7 @@ from django.forms.models import BaseInlineFormSet
 from django.http.request import HttpRequest
 
 from modeltranslation import settings as mt_settings
-from modeltranslation.translator import translator
+from modeltranslation.translator import translator, NotRegistered
 from modeltranslation.utils import (
     build_css_class,
     build_localized_fieldname,
@@ -39,8 +39,28 @@ class TranslationBaseModelAdmin(BaseModelAdmin[_ModelT]):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.trans_opts = translator.get_options_for_model(self.model)
-        self._patch_prepopulated_fields()
+        try:
+            self.trans_opts = translator.get_options_for_model(self.model)
+            self._patch_prepopulated_fields()
+            self._translation_deferred = False
+        except NotRegistered:
+            # Model is not registered for translation yet (common during app loading)
+            # We'll defer the translation setup until it's needed
+            self.trans_opts = None
+            self._translation_deferred = True
+
+    def _ensure_translation_setup(self) -> None:
+        """
+        Ensure translation options are set up, trying to complete deferred initialization if needed.
+        """
+        if self._translation_deferred:
+            try:
+                self.trans_opts = translator.get_options_for_model(self.model)
+                self._patch_prepopulated_fields()
+                self._translation_deferred = False
+            except NotRegistered:
+                # Still not registered, keep the deferred state
+                pass
 
     def _get_declared_fieldsets(
         self, request: HttpRequest, obj: _ModelT | None = None
@@ -77,7 +97,8 @@ class TranslationBaseModelAdmin(BaseModelAdmin[_ModelT]):
     def patch_translation_field(
         self, db_field: Field, field: forms.Field, request: HttpRequest, **kwargs: Any
     ) -> None:
-        if db_field.name in self.trans_opts.all_fields:
+        self._ensure_translation_setup()
+        if self.trans_opts and db_field.name in self.trans_opts.all_fields:
             if field.required:
                 field.required = False
                 field.blank = True
@@ -152,12 +173,13 @@ class TranslationBaseModelAdmin(BaseModelAdmin[_ModelT]):
             return field.widget
 
     def _exclude_original_fields(self, exclude: _ListOrTuple[str] | None = None) -> tuple[str, ...]:
+        self._ensure_translation_setup()
         if exclude is None:
             exclude = tuple()
         if exclude:
             exclude_new = tuple(exclude)
-            return exclude_new + tuple(self.trans_opts.all_fields.keys())
-        return tuple(self.trans_opts.all_fields.keys())
+            return exclude_new + tuple(self.trans_opts.all_fields.keys() if self.trans_opts else [])
+        return tuple(self.trans_opts.all_fields.keys() if self.trans_opts else [])
 
     def replace_orig_field(self, option: Iterable[str | Sequence[str]]) -> _ListOrTuple[str]:
         """
@@ -184,7 +206,8 @@ class TranslationBaseModelAdmin(BaseModelAdmin[_ModelT]):
         >>> self.replace_orig_field((('title', 'url'), 'email', 'text'))
         ['title_de', 'title_en', 'url_de', 'url_en', 'email_de', 'email_en', 'text']
         """
-        if option:
+        self._ensure_translation_setup()
+        if option and self.trans_opts:
             option_new = list(option)
             for opt in option:
                 if opt in self.trans_opts.all_fields:
@@ -199,6 +222,9 @@ class TranslationBaseModelAdmin(BaseModelAdmin[_ModelT]):
         return option  # type: ignore[return-value]
 
     def _patch_prepopulated_fields(self) -> None:
+        if not self.trans_opts:
+            return  # No translation options available
+            
         def localize(sources: Sequence[str], lang: str) -> tuple[str, ...]:
             "Append lang suffix (if applicable) to field list"
 
@@ -282,7 +308,8 @@ class TranslationAdmin(TranslationBaseModelAdmin[_ModelT], admin.ModelAdmin[_Mod
         self._patch_list_editable()
 
     def _patch_list_editable(self) -> None:
-        if self.list_editable:
+        self._ensure_translation_setup()
+        if self.list_editable and self.trans_opts:
             editable_new = list(self.list_editable)
             display_new = list(self.list_display)
             for field in self.list_editable:
@@ -300,7 +327,8 @@ class TranslationAdmin(TranslationBaseModelAdmin[_ModelT], admin.ModelAdmin[_Mod
         # setting TranslationAdmin.group_fieldsets to True. If the admin class
         # already defines a fieldset, we leave it alone and assume the author
         # has done whatever grouping for translated fields they desire.
-        if self.group_fieldsets is True:
+        self._ensure_translation_setup()
+        if self.group_fieldsets is True and self.trans_opts:
             flattened_fieldsets = flatten_fieldsets(fieldsets)
 
             # Create a fieldset to group each translated field's localized fields
