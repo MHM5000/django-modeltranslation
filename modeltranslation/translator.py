@@ -720,7 +720,14 @@ class Translator:
                     # Things without _meta aren't functional models, so they're
                     # uninteresting parents.
                     continue
-                opts.update(self._get_options_for_model(base))
+                base_opts = self._get_options_for_model(base)
+                opts.update(base_opts)
+                
+                # For concrete parent models (like polymorphic base classes),
+                # mark them as related if they're not already registered
+                if (not base._meta.abstract and 
+                    not base_opts.registered):
+                    base_opts.related = True
 
             # Cache options for all models -- we may want to compute options
             # of registered subclasses of unregistered models.
